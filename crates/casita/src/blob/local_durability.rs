@@ -30,6 +30,7 @@ pub(crate) struct LocalDurability {
     filesystem: LocalFileSystem,
     root: Arc<PathBuf>,
     pins: crate::metadata::PinBindings,
+    deletions: super::deletion_barrier::DeletionBarrier,
 }
 
 /// Held from catalog snapshot selection through durable pointer publication.
@@ -114,6 +115,15 @@ impl LocalDurability {
         self
     }
 
+    /// Order deletions after the metadata commits that allow them.
+    pub(crate) fn with_deletion_barrier(
+        mut self,
+        deletions: super::deletion_barrier::DeletionBarrier,
+    ) -> Self {
+        self.deletions = deletions;
+        self
+    }
+
     pub(crate) async fn lock_catalog(&self) -> io::Result<LocalCatalogLock> {
         let durability = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -168,6 +178,7 @@ impl LocalDurability {
             filesystem,
             root: Arc::new(backend_root),
             pins: Default::default(),
+            deletions: Default::default(),
         })
     }
 
@@ -262,6 +273,7 @@ impl LocalDurability {
             .path_to_filesystem(location)
             .map_err(io::Error::other)?;
         let root = Arc::clone(&self.root);
+        self.deletions.before_deletion().await?;
         tokio::task::spawn_blocking(move || durable_delete(&root, &destination))
             .await
             .map_err(io::Error::other)?
@@ -283,6 +295,7 @@ impl LocalDurability {
             })
             .collect::<io::Result<Vec<_>>>()?;
         let root = Arc::clone(&self.root);
+        self.deletions.before_deletion().await?;
         tokio::task::spawn_blocking(move || durable_delete_many(&root, destinations))
             .await
             .map_err(io::Error::other)?
@@ -379,7 +392,7 @@ fn commit_prepared(root: &FsPath, prepared: Vec<PreparedLocalPut>) -> io::Result
             .ok_or_else(|| io::Error::other("durable object path has no parent"))?;
         #[cfg(test)]
         super::crash_tests::file_checkpoint("before-rename", &object.destination);
-        std::fs::rename(&object.temporary, &object.destination)?;
+        crate::durable_rename::replace(&object.temporary, &object.destination)?;
         #[cfg(test)]
         super::crash_tests::file_checkpoint("after-rename", &object.destination);
         parents.push(parent.to_path_buf());
@@ -516,8 +529,8 @@ fn sync_directory_chains(
             ));
         }
     }
-    // Rust does not expose portable directory-handle flushing on non-Unix
-    // platforms. Every data file is still flushed before its atomic rename.
+    // Windows cannot open directories to flush them. Each renamed file is
+    // flushed instead, and every data file is flushed before its rename.
     Ok(())
 }
 

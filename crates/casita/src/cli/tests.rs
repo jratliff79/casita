@@ -3,6 +3,39 @@ use std::path::PathBuf;
 use super::*;
 use casita::experimental::MetadataStore as _;
 
+#[cfg(feature = "oci")]
+#[test]
+fn oci_import_options_parse() {
+    let cli = Cli::try_parse_from([
+        "casita",
+        "import",
+        "-i",
+        "oci",
+        "registry.example.com/team/app:latest",
+        "--root",
+        "images/app",
+        "--oci-platform",
+        "linux/arm64",
+        "--oci-http",
+        "--oci-rootfs-root",
+        "filesystems/app",
+        "--oci-rootfs-max-bytes",
+        "8192",
+        "--oci-rootfs-max-entries",
+        "100",
+    ])
+    .unwrap();
+    let Command::Import(args) = cli.command else {
+        panic!("expected import")
+    };
+    assert_eq!(args.importer, Some(ImporterKind::Oci));
+    assert_eq!(args.oci.platform.as_deref(), Some("linux/arm64"));
+    assert!(args.oci.http);
+    assert_eq!(args.oci.rootfs_root.as_deref(), Some("filesystems/app"));
+    assert_eq!(args.oci.rootfs_max_bytes, 8192);
+    assert_eq!(args.oci.rootfs_max_entries, 100);
+}
+
 #[test]
 fn import_concurrency_options_require_positive_limits() {
     let cli = Cli::try_parse_from([
@@ -476,9 +509,25 @@ fn parses_archive_workflows_and_requires_explicit_selectors_and_names() {
     );
 }
 
-#[tokio::test]
-async fn archive_cli_create_inspect_verify_and_import_round_trip() {
-    archive_cli_create_inspect_verify_and_import_round_trip_case().await;
+/// Runs on a deliberately small stack: unoptimized builds once needed about
+/// 2 MiB here, because the dispatcher awaited every command future inline,
+/// which overflowed Windows. A command awaited without `on_heap` regresses this
+/// on every platform. MSVC frames are larger, so Windows keeps libtest's 2 MiB.
+#[test]
+fn archive_cli_create_inspect_verify_and_import_round_trip() {
+    const STACK_BYTES: usize = if cfg!(windows) { 2 << 20 } else { 3 << 19 };
+    std::thread::Builder::new()
+        .stack_size(STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(archive_cli_create_inspect_verify_and_import_round_trip_case())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 async fn archive_cli_create_inspect_verify_and_import_round_trip_case() {
@@ -509,6 +558,8 @@ async fn archive_cli_create_inspect_verify_and_import_round_trip_case() {
             file_concurrency: None,
             chunk_upload_concurrency: std::num::NonZeroUsize::new(32).unwrap(),
             tar: tar_import_args(),
+            #[cfg(feature = "oci")]
+            oci: OciImportArgs::default(),
             git: git_import_args(),
             casitar: casitar_import_args(),
         }),
@@ -645,6 +696,8 @@ async fn archive_cli_create_inspect_verify_and_import_round_trip_case() {
             file_concurrency: None,
             chunk_upload_concurrency: std::num::NonZeroUsize::new(32).unwrap(),
             tar: tar_import_args(),
+            #[cfg(feature = "oci")]
+            oci: OciImportArgs::default(),
             git: git_import_args(),
             casitar: CasitarImportArgs {
                 roots: Vec::new(),
@@ -865,6 +918,8 @@ async fn sync_command_copies_a_named_root() {
             file_concurrency: None,
             chunk_upload_concurrency: std::num::NonZeroUsize::new(32).unwrap(),
             tar: tar_import_args(),
+            #[cfg(feature = "oci")]
+            oci: OciImportArgs::default(),
             git: git_import_args(),
             casitar: casitar_import_args(),
         }),
@@ -1038,6 +1093,8 @@ async fn sync_command_copies_one_path_under_an_explicit_destination_root() {
             file_concurrency: None,
             chunk_upload_concurrency: std::num::NonZeroUsize::new(32).unwrap(),
             tar: tar_import_args(),
+            #[cfg(feature = "oci")]
+            oci: OciImportArgs::default(),
             git: git_import_args(),
             casitar: casitar_import_args(),
         }),

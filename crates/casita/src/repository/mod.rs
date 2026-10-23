@@ -32,7 +32,7 @@ use crate::path::{PathComponent, SymlinkTarget};
 use crate::spill::{
     FrozenSpillSet, SpillArea, SpillLimits, SpillMetrics, SpillSet, TraversalQueue,
 };
-use crate::{BlobGc, BlobId, ChunkId, Digest, DirectoryId, Node};
+use crate::{BlobGc, BlobId, ChunkId, DirectoryId, Node};
 
 // Implementation modules share only repository-scoped state. Public names
 // remain re-exported here for the application and experimental facades.
@@ -52,7 +52,7 @@ pub(crate) use closure::ClosureAudit;
 pub use closure::ClosureStatus;
 use closure::{
     BlobPayloadReader, CLOSURE_FRONTIER, ClosureVerifier, RepositoryDirectLinkView,
-    verify_closure_against, verify_closure_with,
+    overlay_records, verify_closure_against, verify_closure_with,
 };
 use collection::METADATA_RECLAIM_INTERVAL;
 pub use collection::{
@@ -65,6 +65,8 @@ pub use integrity::{
     FsckDisposition, FsckIssue, FsckIssueKind, FsckRepairAction, FsckRepairActionKind,
     FsckRepairActionStatus, FsckRepairFinding, FsckRepairFindingKind, FsckRepairReport, FsckReport,
 };
+#[cfg(feature = "git")]
+pub(crate) use mutation::PendingGitWitnesses;
 #[cfg(test)]
 use mutation::PublicationTimer;
 pub use mutation::{ConditionalPublishResult, MutationSession, RootExpectation, StagedObject};
@@ -211,6 +213,10 @@ impl<PS, SS> Repository<PS, SS> {
     {
         let payloads = Arc::new(payloads);
         let metadata = Arc::new(metadata);
+        // A payload deletion must not outrun the commit that allowed it.
+        if let Some(commits) = metadata.commit_durability() {
+            payloads.order_deletions_after(commits);
+        }
         let publication = Publication::new(payloads.clone(), metadata.clone());
         let nar_store = metadata
             .verification_facts()
@@ -325,6 +331,10 @@ where
     }
 }
 
+#[cfg(test)]
+mod closure_benchmarks;
+#[cfg(all(test, unix))]
+mod collection_benchmark;
 #[cfg(test)]
 mod fsck_benchmark;
 

@@ -284,23 +284,47 @@ impl<'a> VerificationContext<'a> {
     /// Materialize the payload while enforcing a bound before growing the
     /// returned allocation beyond it.
     pub async fn read_to_end_bounded(&mut self, limit: u64) -> Result<Vec<u8>, FormatError> {
-        let mut output = Vec::new();
+        const MAX_READ: u64 = 64 * 1024;
+        let hint = self.exact_len();
+        let scratch_limit = MAX_READ.min(limit.saturating_add(1)) as usize;
+        let initial = hint
+            .unwrap_or(MAX_READ)
+            .clamp(1, MAX_READ)
+            .min(scratch_limit as u64) as usize;
         // This future is nested through directory verification, publication,
         // and callers' build graphs. Keep the scratch space out of each
         // enclosing future and its poll stack frame.
-        let mut buffer = vec![0u8; 64 * 1024];
+        let mut buffer = vec![0; initial];
+        let mut output = Vec::new();
         loop {
             let read = self.read(&mut buffer).await?;
             if read == 0 {
                 return Ok(output);
             }
-            let new_len = (output.len() as u64)
-                .checked_add(read as u64)
+            let new_len = output
+                .len()
+                .checked_add(read)
                 .ok_or(FormatError::PayloadSizeOverflow)?;
-            if new_len > limit {
+            if new_len as u64 > limit {
                 return Err(FormatError::MetadataLimit { limit });
             }
+            if new_len > output.capacity() {
+                // Vec's default growth can exceed the metadata limit, even
+                // for tiny allocations. Bound geometric growth explicitly.
+                let capacity = output
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(new_len)
+                    .min(usize::try_from(limit).unwrap_or(usize::MAX));
+                output.reserve_exact(capacity - output.len());
+            }
             output.extend_from_slice(&buffer[..read]);
+            // A hint sizes scratch space only; it never proves EOF. If it
+            // understates the payload, continue with full-size reads rather
+            // than many small ones. Accurate hints keep their small EOF buffer.
+            if new_len as u64 > hint.unwrap_or(u64::MAX) && buffer.len() < scratch_limit {
+                buffer.resize(scratch_limit, 0);
+            }
         }
     }
 
@@ -390,6 +414,10 @@ pub trait ObjectFormat: Send + Sync {
 #[derive(Clone)]
 pub struct FormatRegistry {
     formats: Arc<BTreeMap<NamespaceId, Arc<dyn ObjectFormat>>>,
+    // A namespace spelling cannot identify its verifier's relational rules, so
+    // only the built-in factory may vouch for private construction proofs.
+    #[cfg(feature = "native")]
+    builtin: bool,
 }
 
 impl FormatRegistry {
@@ -406,6 +434,8 @@ impl FormatRegistry {
         }
         Ok(Self {
             formats: Arc::new(by_namespace),
+            #[cfg(feature = "native")]
+            builtin: false,
         })
     }
 
@@ -421,7 +451,49 @@ impl FormatRegistry {
         formats.extend(crate::ipld::formats());
         formats.extend(crate::git::formats());
         formats.push(Arc::new(crate::LinkedObjectFormat::default()));
-        Self::new(formats).expect("the built-in namespaces are distinct")
+        #[cfg_attr(not(feature = "native"), allow(unused_mut))]
+        let mut registry = Self::new(formats).expect("the built-in namespaces are distinct");
+        #[cfg(feature = "native")]
+        {
+            registry.builtin = true;
+        }
+        registry
+    }
+
+    /// Whether every verifier is the built-in one for its namespace.
+    ///
+    /// Importers prove the built-in rules while constructing a graph. A
+    /// registry assembled by [`Self::new`] may add relations under the same
+    /// namespace spellings, so its closures must be audited normally.
+    #[cfg(feature = "native")]
+    pub(crate) fn is_builtin(&self) -> bool {
+        self.builtin
+    }
+
+    /// Whether a present record alone proves its complete closure.
+    ///
+    /// A built-in raw blob has no links and its identity is the payload digest
+    /// the record binds, so its closure is the record and that payload. A
+    /// built-in Git blob has no links either, and its record was admitted only
+    /// after that immutable payload hashed to its object ID: checking its
+    /// closure would repeat exactly that check. Payloads outlive their records
+    /// under the same rules as a stored witness, so the repository derives
+    /// this instead of storing one witness per blob.
+    #[cfg(feature = "native")]
+    pub(crate) fn intrinsically_complete(&self, record: &ObjectRecord) -> bool {
+        let key = record.key();
+        self.builtin
+            && record.links().is_empty()
+            && ((key.namespace().as_str() == BLOB_NAMESPACE
+                && key.native_id() == record.payload().digest().as_bytes().as_slice())
+                || is_git_blob(key))
+    }
+
+    /// Whether any present record under this key is intrinsically complete,
+    /// so presence alone settles it without reading the record's links.
+    #[cfg(feature = "git")]
+    pub(crate) fn complete_when_present(&self, key: &ObjectKey) -> bool {
+        self.builtin && is_git_blob(key)
     }
 
     /// Resolve the verifier for an exact namespace.
@@ -769,6 +841,15 @@ fn invalid_direct_record(source: &ObjectKey, target: &ObjectKey) -> FormatError 
         target: target.clone(),
         message: "record does not match its declared key or verified payload".to_owned(),
     }
+}
+
+/// Whether a key names a native Git blob in either object format.
+#[cfg(feature = "native")]
+fn is_git_blob(key: &ObjectKey) -> bool {
+    matches!(
+        key.namespace().as_str(),
+        crate::git::GIT_SHA1_BLOB_NAMESPACE | crate::git::GIT_SHA256_BLOB_NAMESPACE
+    )
 }
 
 #[cfg(all(test, feature = "native"))]

@@ -157,7 +157,6 @@ impl TursoDb {
     #[tracing::instrument(name = "state.turso.open", skip_all)]
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Self>, Error> {
         let path = path.as_ref().to_path_buf();
-        let database_existed = path.exists();
         let path_str = path.to_str().ok_or_else(|| {
             Error::from(format!(
                 "Turso database path is not valid UTF-8: {}",
@@ -180,33 +179,13 @@ impl TursoDb {
             writer.set_transaction_behavior(turso::transaction::TransactionBehavior::Immediate);
             configure_connection(&writer)?;
 
-            let mut rows = writer.query("PRAGMA user_version", ()).await?;
-            let found: i64 = rows
-                .next()
-                .await?
-                .ok_or("PRAGMA user_version returned no row")?
-                .get(0)?;
-            let initialize = found == 0 && !database_existed;
-            if found != REPOSITORY_USER_VERSION && !initialize {
-                return Err(Error::from(format!(
-                    "database {} has unsupported schema version {found}; this casita release \
-                     supports only version {REPOSITORY_USER_VERSION} and does not migrate \
-                     pre-release repositories; recreate or re-import it",
-                    path.display()
-                )));
-            }
-
             // Opening an already-current repository is a read-only operation.
             // Besides avoiding needless WAL traffic in the common case, this
             // is what lets an existing repository open after its filesystem
             // has reached ENOSPC so collection can reclaim space.
-            if initialize {
-                writer
-                    .execute_batch(format!(
-                        "BEGIN IMMEDIATE;\n{REPOSITORY_SCHEMA}\n\
-                         PRAGMA user_version = {REPOSITORY_USER_VERSION};\nCOMMIT;"
-                    ))
-                    .await?;
+            let found = query_i64(&writer, "PRAGMA user_version").await?;
+            if found != REPOSITORY_USER_VERSION {
+                initialize_schema(&writer, found, &path).await?;
             }
             // `synchronous` is connection-local and changes no persistent
             // page, so configuring it does not consume filesystem space.
@@ -235,33 +214,57 @@ impl TursoDb {
     /// - **cancellation-safe**: a `spawn_blocking` task runs to completion even
     ///   if the caller drops the returned future, so a cancelled write cannot
     ///   abandon a half-applied transaction on the shared writer connection and
-    ///   strand it (Turso only rolls a dropped transaction back lazily, on the
-    ///   connection's next use).
+    ///   strand it.
+    ///
+    /// The operation's transaction always ends with it. Turso rolls a dropped
+    /// transaction back only lazily, on the connection's next use, and until
+    /// then its `BEGIN IMMEDIATE` holds the WAL write lock: every writer in
+    /// another process would wait out the busy timeout and fail. So an
+    /// operation that returns with its transaction still open (typically one
+    /// that failed, e.g. on a metadata check) is rolled back here, and a
+    /// writer that cannot be rolled back is replaced.
     pub(crate) async fn write<T, F>(self: &Arc<Self>, f: F) -> Result<T, Error>
     where
         F: for<'a> FnOnce(&'a mut Connection) -> BoxFuture<'a, Result<T, Error>> + Send + 'static,
         T: Send + 'static,
     {
-        // The owned guard keeps the one writer connection (and its lazy
-        // dangling-transaction state) across calls; the blocking task holds it
-        // until the write finishes, so the next write waits rather than racing.
+        // The owned guard keeps the one writer connection across calls; the
+        // blocking task holds it until the write finishes, so the next write
+        // waits rather than racing.
         let mut guard = self.writer.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || futures::executor::block_on(f(&mut guard))).await?
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            futures::executor::block_on(async move {
+                let result = f(&mut guard).await;
+                let ended = end_transaction(&guard).await;
+                if ended.is_err() {
+                    // Dropping the old connection releases its locks.
+                    *guard = this.connect_writer().await?;
+                }
+                result
+            })
+        })
+        .await?
     }
 
     /// Replace the serialized writer after a failed transaction.
     ///
-    /// Turso rolls abandoned transactions back lazily when their connection is
-    /// reused. An ENOSPC during commit can leave that cleanup path unable to
+    /// An ENOSPC during commit can leave the rollback path unable to
     /// distinguish an already-aborted transaction, so emergency collection
     /// retries on a fresh connection instead.
     pub(crate) async fn reset_writer(&self) -> Result<(), Error> {
+        let writer = self.connect_writer().await?;
+        *self.writer.lock().await = writer;
+        Ok(())
+    }
+
+    /// A new serialized write connection.
+    async fn connect_writer(&self) -> Result<Connection, Error> {
         let mut writer = self.database.connect()?;
         writer.set_transaction_behavior(turso::transaction::TransactionBehavior::Immediate);
         configure_connection(&writer)?;
         writer.execute_batch("PRAGMA synchronous = FULL;").await?;
-        *self.writer.lock().await = writer;
-        Ok(())
+        Ok(writer)
     }
 
     /// Read on one query-only transaction without loading a metadata snapshot.
@@ -341,6 +344,85 @@ impl TursoDb {
 impl std::fmt::Debug for TursoDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TursoDb").field("path", &self.path).finish()
+    }
+}
+
+async fn query_i64(conn: &Connection, sql: &str) -> Result<i64, Error> {
+    let mut rows = conn.query(sql, ()).await?;
+    Ok(rows
+        .next()
+        .await?
+        .ok_or_else(|| format!("{sql} returned no row"))?
+        .get(0)?)
+}
+
+/// Create the repository schema in a database that has none, or reject it.
+///
+/// Whether to initialize depends on the database contents, not on whether the
+/// file existed: a crash after Turso created the file (possibly empty, possibly
+/// with a WAL) but before the schema committed must not strand the repository.
+/// An unversioned database is ours to initialize only while it holds no schema
+/// object at all; any foreign table means it is not a casita database.
+/// The decision is made again under the WAL write lock, so openers that bypass
+/// the repository lease still cannot both initialize or race a foreign writer.
+async fn initialize_schema(writer: &Connection, found: i64, path: &Path) -> Result<(), Error> {
+    let unsupported = |found: i64| {
+        Error::from(format!(
+            "database {} has unsupported schema version {found}; this casita release \
+             supports only version {REPOSITORY_USER_VERSION} and does not migrate \
+             pre-release repositories; recreate or re-import it",
+            path.display()
+        ))
+    };
+    if found != 0 {
+        return Err(unsupported(found));
+    }
+    writer.execute_batch("BEGIN IMMEDIATE;").await?;
+    let decided = async {
+        let found = query_i64(writer, "PRAGMA user_version").await?;
+        if found == REPOSITORY_USER_VERSION {
+            // Another opener initialized it while this one waited.
+            return Ok(false);
+        }
+        let objects = query_i64(writer, "SELECT count(*) FROM sqlite_schema").await?;
+        if found != 0 || objects != 0 {
+            return Err(unsupported(found));
+        }
+        Ok(true)
+    }
+    .await;
+    match decided {
+        Ok(true) => {
+            writer
+                .execute_batch(format!(
+                    "{REPOSITORY_SCHEMA}\n\
+                     PRAGMA user_version = {REPOSITORY_USER_VERSION};\nCOMMIT;"
+                ))
+                .await?;
+            Ok(())
+        }
+        Ok(false) => Ok(writer.execute_batch("ROLLBACK;").await?),
+        Err(error) => {
+            // Report why the database was refused, not a cleanup failure; the
+            // caller drops this connection with the failed open anyway.
+            let _ = writer.execute_batch("ROLLBACK;").await;
+            Err(error)
+        }
+    }
+}
+
+/// End any transaction an operation left open on `connection`.
+///
+/// Errors when the connection cannot be returned to autocommit; its owner
+/// must then discard it.
+async fn end_transaction(connection: &Connection) -> Result<(), Error> {
+    if connection.is_autocommit()? {
+        return Ok(());
+    }
+    connection.execute_batch("ROLLBACK;").await?;
+    match connection.is_autocommit()? {
+        true => Ok(()),
+        false => Err(Error::from("writer transaction survived its rollback")),
     }
 }
 
@@ -461,6 +543,62 @@ mod tests {
             pool.iter()
                 .all(|connection| connection.is_autocommit().unwrap())
         );
+    }
+
+    /// A failed write must end its transaction before releasing the writer:
+    /// an abandoned `BEGIN IMMEDIATE` holds the WAL write lock, so writers in
+    /// other processes (simulated by a second handle on the same file) would
+    /// wait out the whole busy timeout and fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_write_releases_the_write_lock_for_other_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abandoned.sqlite");
+        let db = TursoDb::open(&path).unwrap();
+        db.write(|connection| {
+            Box::pin(async move {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE read_pool_test(value INTEGER);
+                         INSERT INTO read_pool_test VALUES(1);",
+                    )
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let other = TursoDb::open(&path).unwrap();
+
+        let failed = db
+            .write(|connection| {
+                Box::pin(async move {
+                    let transaction = connection.transaction().await?;
+                    transaction
+                        .execute("UPDATE read_pool_test SET value = 2", ())
+                        .await?;
+                    // A failed check: the transaction is dropped uncommitted.
+                    Err::<(), Error>(Error::from("check failed"))
+                })
+            })
+            .await;
+        assert!(failed.is_err());
+        assert!(db.writer.lock().await.is_autocommit().unwrap());
+
+        let foreign = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            other.write(|connection| {
+                Box::pin(async move {
+                    connection
+                        .execute_batch("UPDATE read_pool_test SET value = 3")
+                        .await?;
+                    Ok(())
+                })
+            }),
+        )
+        .await
+        .expect("the other process's write must not wait for the abandoned transaction");
+        foreign.unwrap();
+        assert_eq!(read_number(&db).await, 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -814,5 +952,115 @@ mod tests {
                 assert_eq!(row.get::<Vec<u8>>(2).unwrap(), vec![2, 3]);
             });
         }
+    }
+
+    /// Build the database the way `TursoDb::open` does, without casita's schema.
+    fn open_raw(path: &Path) -> (Database, Connection) {
+        futures::executor::block_on(async {
+            let builder = Builder::new_local(path.to_str().unwrap());
+            #[cfg(windows)]
+            let builder = builder.with_io("experimental_win_iocp");
+            let database = builder
+                .experimental_multiprocess_wal(true)
+                .build()
+                .await
+                .unwrap();
+            let connection = database.connect().unwrap();
+            (database, connection)
+        })
+    }
+
+    fn schema_names(database: &Arc<TursoDb>) -> Vec<String> {
+        futures::executor::block_on(async {
+            let writer = database.writer.lock().await;
+            let mut rows = writer
+                .query("SELECT name FROM sqlite_schema ORDER BY name", ())
+                .await
+                .unwrap();
+            let mut result = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                result.push(row.get::<String>(0).unwrap());
+            }
+            result
+        })
+    }
+
+    #[test]
+    fn zero_byte_database_file_is_initialized() {
+        // A crash right after the file was created leaves it empty.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("casita.sqlite");
+        std::fs::File::create(&path).unwrap();
+
+        let database = TursoDb::open(&path).unwrap();
+        assert_eq!(user_version(&database), REPOSITORY_USER_VERSION);
+        assert!(schema_names(&database).contains(&"repository_state".to_owned()));
+        drop(database);
+        let reopened = TursoDb::open(&path).unwrap();
+        assert_eq!(user_version(&reopened), REPOSITORY_USER_VERSION);
+    }
+
+    #[test]
+    fn database_left_without_schema_by_an_interrupted_open_is_initialized() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("casita.sqlite");
+        // Simulate a crash between Turso creating the database and the schema
+        // transaction committing: the file (and its WAL) exist, but no schema
+        // object or user_version was ever published.
+        let (database, connection) = open_raw(&path);
+        futures::executor::block_on(async {
+            connection
+                .execute_batch("BEGIN IMMEDIATE; CREATE TABLE interrupted(x); ROLLBACK;")
+                .await
+                .unwrap();
+        });
+        drop(connection);
+        drop(database);
+        assert!(path.exists());
+
+        let database = TursoDb::open(&path).unwrap();
+        assert_eq!(user_version(&database), REPOSITORY_USER_VERSION);
+        let names = schema_names(&database);
+        assert!(names.contains(&"repository_state".to_owned()));
+        assert!(!names.contains(&"interrupted".to_owned()));
+    }
+
+    #[test]
+    fn unversioned_database_with_foreign_schema_is_rejected_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("casita.sqlite");
+        let (database, connection) = open_raw(&path);
+        futures::executor::block_on(async {
+            connection
+                .execute_batch("CREATE TABLE foreign_data(x); INSERT INTO foreign_data VALUES (7);")
+                .await
+                .unwrap();
+        });
+        drop(connection);
+        drop(database);
+
+        let error = TursoDb::open(&path).unwrap_err().to_string();
+        assert!(error.contains("unsupported schema version 0"), "{error}");
+
+        let (database, connection) = open_raw(&path);
+        futures::executor::block_on(async {
+            let mut rows = connection
+                .query("SELECT name FROM sqlite_schema ORDER BY name", ())
+                .await
+                .unwrap();
+            let mut names = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                names.push(row.get::<String>(0).unwrap());
+            }
+            assert_eq!(names, ["foreign_data"]);
+            drop(rows);
+            let mut rows = connection.query("PRAGMA user_version", ()).await.unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                0
+            );
+        });
+        drop(connection);
+        drop(database);
     }
 }

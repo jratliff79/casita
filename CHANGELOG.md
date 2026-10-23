@@ -13,6 +13,32 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
 
 ### Added
 
+- `GitClosureImport` imports selected native Git closures without named views or
+  per-revision inventories. It reuses verified subtrees and returns a retained
+  reader protecting the result until application roots are published. A
+  malformed selection, or a selected root of the wrong type, fails as invalid
+  input before decoding. Closure witnesses are committed in batches of at most
+  `max_batch_objects`, and only once the whole selection is proven complete.
+  Repeating an interrupted import completes them.
+
+- `MutationSession::stage_object_reader_with_size` verifies an exact-length
+  source while writing it, avoiding a verification reread of the stored payload.
+  Native identity, complete consumption, and backend digest and length remain
+  independently checked.
+- `MutationSession::stage_git_blob_file` and `stage_git_blob_files` register
+  stored verified native Git blobs as ordinary files without reading or
+  writing their payloads again. A batch takes one metadata read, one
+  protection request and one recheck. The receiving mutation pins the reused
+  bytes, and repositories with a replacement format registry refuse it.
+- `MutationSession::publish_closures` atomically publishes records and checks
+  bounded closure targets without creating named roots. Only the targets gain
+  reusable witnesses, raw blobs need none, and the mutation keeps the checked
+  graphs protected.
+- `RepositoryGeneration` orders the logical states of one repository.
+  `MetadataReader::generation` and `RetainedReader::generation` report a
+  reader's position in the commit order, so an application holding several
+  readers can tell which one observes the newest state without comparing
+  their unordered `RepositoryRevision`s.
 - `experimental::RepositoryProfile` groups a repository's deployment policy
   (cross-process coordination, spill placement and limits, emergency
   collection, the import cache and disk-pressure maintenance) in one value.
@@ -95,6 +121,59 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
 
 ### Changed
 
+- Bounded metadata reads during verification size their scratch buffer from
+  the payload's length hint instead of always allocating 64 KiB.
+- Chunk hashing batches up to four chunks and 1 MiB per blocking job;
+  larger individual chunks run alone. A lone chunk of at most 4 KiB
+  is hashed inline.
+- Chunked blob writes store manifest pages as their source-ordered prefix
+  completes. Completed metadata behind a straggler is bounded to 16 upload
+  windows, with a minimum of 64 entries, plus in-flight uploads. A stalled
+  writer releases queued memory admission, and publication checks that the
+  manifest covers every hashed byte. Encodings and blob identities are unchanged.
+- Chunked blob writes refill their upload window whenever any upload
+  completes and keep driving uploads while source reads are pending.
+- Publishing a built-in raw blob no longer stores a closure witness for it,
+  and incremental closure checks no longer open its payload. A blob record has
+  no links and names its own payload, so its presence already proves a
+  complete closure. Imports no longer record a witness for every file, and the
+  import cache recognizes any present blob. Named root targets still keep a
+  witness.
+- Built-in Git blobs, like raw blobs, need no stored closure witness. Git
+  closure imports record witnesses only for trees, commits, tags and selected
+  roots, probe blobs for presence alone, and incremental closure checks settle
+  stored or staged Git blobs without opening their payloads.
+- Republishing objects or witnesses that already exist no longer rewrites
+  them. Turso stores a new object's witness with its row and updates only
+  rows still unwitnessed; WAL3 deltas carry only objects and witnesses the
+  commit adds, so republished batches no longer re-encode into every later
+  tail record.
+- A publication whose commit is refused by a concurrent change no longer
+  walks its closures again on retry. Its pins retain every closure it proved,
+  so the proofs hold at the newer revision.
+- On macOS, repositories whose state is a `TursoMetadataStore`, including
+  `Repository::local` and custom compositions, flush the drive cache
+  (`F_FULLFSYNC`) before each deletion batch. Commits sync only to the drive's
+  volatile cache there, so a power loss could previously keep a collection's
+  deletions while losing the commit that allowed them, leaving roots that
+  referenced deleted payloads.
+  Commits themselves cost nothing more; collection pays per deletion batch.
+- Publishing a packed catalog to an object store that lacks conditional
+  updates now fails with `NotSupported` instead of silently overwriting the
+  catalog pointer, which let concurrent writers lose each other's updates.
+- SSH transfers pass `ConnectTimeout=30`, `ServerAliveInterval=15`, and
+  `ServerAliveCountMax=3` to OpenSSH, so an unreachable or silent host fails
+  the sync instead of blocking it indefinitely.
+- Object-store pin ledgers recognize their own write when its response is
+  lost, such as when the connection drops after the store applied it or a
+  client retry is refused by its own precondition. A retry previously applied
+  the edit again under a new token, leaving the first pin, deletion claim,
+  collector or logical prune recorded with no owner, and reported
+  revision-conditional edits as conflicts although they had landed. An
+  ownerless pin kept its payloads from ever being collected, an ownerless
+  claim blocked writers of its resources, and an ownerless collector blocked
+  collection. A store error on a ledger write is now retried within the
+  edit's attempt budget instead of returned at once.
 - Transfer has two entry points, `transfer` and `transfer_path`, each taking
   `TransferOptions`. `transfer_session`, `transfer_session_with_discovery`,
   `transfer_path_session` and `transfer_path_session_with_discovery` were
@@ -174,6 +253,43 @@ and will use [Semantic Versioning](https://semver.org/) for tagged releases.
   releases them only when it is polled again. Two new pack read counters,
   `readahead_deferrals` and `buffer_bypasses`, report how often the budget runs
   out.
+
+### Fixed
+
+- NAR intake no longer stalls when Tokio's blocking pool is exhausted. The
+  archive decoder occupied a blocking worker while waiting on the consumer,
+  which needs that pool to store the archive; with one worker, a 32 MiB file
+  never finished importing. Decoders now run on their own threads, at most 16
+  per process; further imports wait for a decoder slot.
+- A chunked writer waiting on the shared chunk memory budget keeps its
+  place in the queue while its own uploads complete.
+- A lone loose chunk whose blob identity is known at EOF is protected
+  together with its blob and Bao path, avoiding a second ledger edit.
+- A new loose chunk uses one existence probe. Pinned writers remember
+  chunks they store so repeated chunks in the batch need no further probe.
+- A cancelled chunked write retains its chunk memory budget while queued
+  hashing or compression still holds the chunk bytes, preventing concurrent
+  writers from exceeding the budget.
+- Traversals that spill to temporary storage open their spill database on
+  the blocking pool, like every later statement, instead of parsing its schema
+  on the caller's stack. Deep publications with small spill limits could
+  overflow the stack of a debug build.
+- An S3 repository no longer becomes unreadable after a commit raced a WAL
+  collection run by another handle. The collection appends a checkpoint of the
+  unchanged state, so the commit found its log position taken, saw the same
+  revision, and retried the record it had built on the old log: a delta then
+  named a checkpoint the collection deletes, or the committing handle recorded
+  its checkpoint at the position it first aimed at and broke the revision chain
+  with its next commit. Every commit was acknowledged, but a freshly opened
+  handle failed with `wal3 manifest has no record at position …` or
+  `wal3 delta revision chain is invalid`. A commit whose log moved under it is
+  now rebuilt on the log as it is, and caches the position where its record
+  actually lands.
+- Filesystem, NAR and Git imports into a repository built with a custom
+  `FormatRegistry` no longer bypass its verifiers' relational rules. Their
+  construction proofs cover only the built-in formats, so such imports now
+  audit each constructed closure before publishing it or its witnesses. The
+  walks of one publication share their proofs, so each object is read once.
 
 ### Security
 
