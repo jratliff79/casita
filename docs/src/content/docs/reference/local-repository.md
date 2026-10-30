@@ -95,8 +95,9 @@ either may be discarded: losing one costs work, never correctness.
   whole. Records are immutable and only collection removes them, so a closure
   that verified once stays verified; publication, checkout, and synchronization
   stop their walk at a remembered one instead of re-reading everything beneath
-  it. `fsck` ignores the table, because reading the bytes back is exactly what
-  an audit is for.
+  it. File contents need no entry: a raw blob's record has no links and names
+  its own payload, so its presence is the proof. `fsck` ignores the table,
+  because reading the bytes back is exactly what an audit is for.
 - **The ingest cache** records which content each imported file held, keyed by
   the device, inode, size, and both timestamps the walk observed. See
   [Imports](../../concepts/imports/).
@@ -114,6 +115,16 @@ databases with any other `PRAGMA user_version` are rejected without mutation;
 development-only schemas from before the first release must be recreated or
 re-imported. A future schema change will require an explicit offline migration
 rather than modifying a repository during ordinary open.
+
+Every commit syncs the WAL before it is acknowledged (`synchronous = FULL`).
+On Linux and Windows that sync reaches stable storage. On macOS it reaches the
+drive's volatile cache, so a power loss may discard the most recent
+acknowledged commits. Deletions that a commit allows (collection sweeps and
+catalog reclamation) first flush the drive cache (`F_FULLFSYNC`), so a power
+loss cannot keep those deletions while losing the commit behind them. The
+repository reopens consistent, at an earlier revision. Casita flushes before
+every deletion batch, rather than on every commit. WAL size and modification
+time cannot identify commits that finished syncing after an earlier flush.
 
 ## Physical payload behavior
 

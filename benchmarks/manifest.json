@@ -480,6 +480,57 @@
   ],
   "entrypoints": [
     {
+      "id": "chunk-hash-batch",
+      "suite_id": "native-git",
+      "title": "Bounded chunk hash jobs across count, byte and admission boundaries",
+      "kind": "module",
+      "target": "benchmarks.suites.chunk_hash_batch",
+      "profiles": [
+        "smoke",
+        "standard"
+      ],
+      "correctness": [
+        "independent BLAKE3 and FastCDC",
+        "exhaustive verified readback",
+        "identical paired chunk metadata",
+        "zero duplicate chunk writes"
+      ]
+    },
+    {
+      "id": "chunk-manifest-stream",
+      "suite_id": "native-git",
+      "title": "Streaming manifest construction with bounded fixtures and exact manifest identities",
+      "kind": "module",
+      "target": "benchmarks.suites.chunk_manifest_stream",
+      "profiles": [
+        "smoke",
+        "standard"
+      ],
+      "correctness": [
+        "independent streaming BLAKE3",
+        "exhaustive verified streaming readback",
+        "identical paired manifest bytes",
+        "fixed-size fixture buffers"
+      ]
+    },
+    {
+      "id": "chunk-upload-completion",
+      "suite_id": "native-git",
+      "title": "Chunk upload stragglers with canonical manifest and verified readback gates",
+      "kind": "module",
+      "target": "benchmarks.suites.chunk_upload_completion",
+      "profiles": [
+        "smoke",
+        "standard"
+      ],
+      "correctness": [
+        "independent FastCDC boundaries and chunk hashes",
+        "verified full readback",
+        "all started uploads completed",
+        "identical paired blob identity"
+      ]
+    },
+    {
       "id": "pin-protocol-s3",
       "suite_id": "state-and-publication",
       "title": "Pin protocol prototypes on RustFS with independent writers, GC and fault readback gates",
@@ -590,6 +641,52 @@
         "smoke",
         "standard"
       ]
+    },
+    {
+      "id": "git-verified-stream",
+      "suite_id": "native-git",
+      "title": "One-pass native Git verification and payload storage",
+      "kind": "module",
+      "target": "benchmarks.suites.git_verified_stream",
+      "profiles": ["smoke", "standard"],
+      "correctness": ["identical native identities", "exact payload lengths", "complete closures", "byte-for-byte readback"]
+    },
+    {
+      "id": "git-blob-file",
+      "suite_id": "native-git",
+      "title": "Register verified Git blob contents as files without payload rereads",
+      "kind": "module",
+      "target": "benchmarks.suites.git_blob_file",
+      "profiles": ["smoke", "standard"],
+      "correctness": ["identical file identities", "exact payload lengths", "complete closures", "byte-for-byte readback"]
+    },
+    {
+      "id": "git-closure-import",
+      "suite_id": "native-git",
+      "title": "Inventory-free Git closure import and persistent cross-root reuse",
+      "kind": "module",
+      "target": "benchmarks.suites.git_closure_import",
+      "profiles": ["smoke", "standard"],
+      "correctness": ["exact imported and reused object counts", "blob witnesses exactly as each probe's declared witness policy requires", "exhaustive closure verification", "zero source bytes for warm imports"]
+    },
+    {
+      "id": "git-closure-import-small-files",
+      "suite_id": "native-git",
+      "title": "Git closure imports of many small files, where stored witnesses per blob were a large share of cost",
+      "kind": "module",
+      "target": "benchmarks.suites.git_closure_import",
+      "default_arguments": ["--counts", "16384", "--file-bytes", "64", "--max-buffered-bytes", "67108864", "--concurrency", "16", "--layout", "packed", "--backend", "local"],
+      "profiles": ["smoke", "standard"],
+      "correctness": ["exact imported and reused object counts", "blob witnesses exactly as each probe's declared witness policy requires", "exhaustive closure verification", "zero source bytes for warm imports"]
+    },
+    {
+      "id": "git-closure-audit",
+      "suite_id": "native-git",
+      "title": "Git closure import audits of linear histories with built-in and custom registries",
+      "kind": "module",
+      "target": "benchmarks.suites.git_closure_audit",
+      "profiles": ["smoke", "standard"],
+      "correctness": ["exact imported object counts", "every object audited exactly once by custom registries", "exactly each probe's declared witness policy in full publication batches", "exhaustive closure verification", "zero source bytes for warm imports"]
     },
     {
       "id": "git-import-profile",
@@ -1278,6 +1375,8 @@
         "--bench",
         "optimization",
         "--bench",
+        "metadata_verification",
+        "--bench",
         "compression_handoff",
         "--bench",
         "git_fetch_fairness",
@@ -1602,6 +1701,34 @@
       ]
     },
     {
+      "id": "deletion-ordering",
+      "suite_id": "collection-and-fsck",
+      "title": "Collection passes with and without deletions that wait for their commits",
+      "kind": "module",
+      "target": "benchmarks.suites.native_probes",
+      "default_arguments": [
+        "--probe",
+        "deletion-ordering"
+      ],
+      "profiles": [
+        "custom"
+      ]
+    },
+    {
+      "id": "metadata-durability",
+      "suite_id": "state-and-publication",
+      "title": "Turso commit latency with the production sync and with a drive-cache flush",
+      "kind": "module",
+      "target": "benchmarks.suites.native_probes",
+      "default_arguments": [
+        "--probe",
+        "metadata-durability"
+      ],
+      "profiles": [
+        "custom"
+      ]
+    },
+    {
       "id": "catalog-maintenance",
       "suite_id": "blob-backends",
       "title": "Catalog reclamation marker",
@@ -1624,6 +1751,48 @@
       "default_arguments": [
         "--probe",
         "catalog-durability"
+      ],
+      "profiles": [
+        "custom"
+      ]
+    },
+    {
+      "id": "wal3-commit-preparation",
+      "suite_id": "state-and-publication",
+      "title": "WAL3 commit tail preparation at checkpoint count and byte limits",
+      "kind": "module",
+      "target": "benchmarks.suites.native_probes",
+      "default_arguments": [
+        "--probe",
+        "wal3-commit-preparation"
+      ],
+      "profiles": [
+        "custom"
+      ]
+    },
+    {
+      "id": "raw-blob-closures",
+      "suite_id": "state-and-publication",
+      "title": "Raw blob publication without stored closure witnesses",
+      "kind": "module",
+      "target": "benchmarks.suites.native_probes",
+      "default_arguments": [
+        "--probe",
+        "raw-blob-closures"
+      ],
+      "profiles": [
+        "custom"
+      ]
+    },
+    {
+      "id": "concurrent-publication",
+      "suite_id": "state-and-publication",
+      "title": "Concurrent rooted publications verifying closures under the commit lock",
+      "kind": "module",
+      "target": "benchmarks.suites.native_probes",
+      "default_arguments": [
+        "--probe",
+        "concurrent-publication"
       ],
       "profiles": [
         "custom"
@@ -2088,6 +2257,22 @@
           ],
           "included_in": "benchmark all --suites core-primitives"
         },
+        "nar-decoder-admission": {
+          "runner": "cargo bench --bench nar_import -- 'nar_decoder_(pool|admission)'",
+          "correctness_runner": "cargo bench --bench nar_import -- 'nar_decoder_(pool|admission)' --test",
+          "groups": {
+            "nar_decoder_pool": "one regular-file import of 8 or 32 MiB into a fresh repository on a current-thread runtime with 1 or 2 blocking workers",
+            "nar_decoder_admission": "16, 17 or 32 concurrent 2 MiB imports into one repository, each its own task on a multi-threaded runtime"
+          },
+          "decoder_limit": 16,
+          "purpose": "Keep NAR decoders off the blocking pool their consumers need, and measure the cost of the process-wide decoder limit on both sides of it.",
+          "correctness": [
+            "canonical SHA-256 and NAR size",
+            "payload bytes hashed, or no association hit",
+            "independent stored-content scrub"
+          ],
+          "included_in": "benchmark all --suites core-primitives"
+        },
         "verification-buffers": {
           "runner": "cargo bench --features experimental --bench optimization -- verification_buffers",
           "payload_sizes_bytes": [
@@ -2114,6 +2299,44 @@
             "EOF observed",
             "configured buffer cap"
           ]
+        },
+        "metadata-verification-buffers": {
+          "runner": "cargo bench --no-default-features --features experimental --bench metadata_verification",
+          "payload_sizes_bytes": [
+            0,
+            1,
+            128,
+            1024,
+            16384,
+            65535,
+            65536,
+            65537,
+            262144
+          ],
+          "length_hints": [
+            "known",
+            "unknown",
+            "understated: one byte, for payloads over one byte"
+          ],
+          "metadata_limit_bytes": 268435456,
+          "variants": [
+            "scratch_64k: former 64 KiB scratch helper",
+            "hybrid: rejected direct read of known payloads up to 64 KiB",
+            "production: hint-sized scratch, switching to 64 KiB after an understated hint"
+          ],
+          "metrics": [
+            "bounded metadata read latency",
+            "largest read buffer in bytes, emitted as JSON"
+          ],
+          "correctness": [
+            "complete payload bytes",
+            "whole-payload identity",
+            "complete payload size",
+            "EOF observed",
+            "64 KiB read cap",
+            "hint-sized production scratch for accurate hints"
+          ],
+          "included_in": "benchmark all --suites core-primitives"
         },
         "sliced-transfer": {
           "runner": "cargo bench --features ssh,experimental --bench sliced_transfer",
@@ -2495,6 +2718,7 @@
         "commit-stale",
         "commit-repoint-root",
         "commit-remove-root",
+        "commit-durability",
         "snapshot",
         "publish",
         "publish-if-roots-match",
@@ -2649,6 +2873,7 @@
         "fsck",
         "collect",
         "collect-with-reader",
+        "collect-ordered-deletions",
         "corruption-scan",
         "enospc-recovery"
       ],

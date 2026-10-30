@@ -248,7 +248,7 @@ async fn decode<R: AsyncRead + Unpin + Send>(
     // error before dropping the pipe end the next one is waiting on.
     let first = std::sync::Arc::new(std::sync::Mutex::new(None::<NarError>));
     let record = |error: NarError| record_first(&first, error);
-    let decoder = tokio::task::spawn_blocking({
+    let decoder = super::decoder::run({
         let first = first.clone();
         move || {
             let mut wire = tokio_util::io::SyncIoBridge::new(wire);
@@ -310,7 +310,7 @@ async fn decode<R: AsyncRead + Unpin + Send>(
         consumed
     };
     let (consumed, decoded, pumped) = tokio::join!(consume, decoder, pump);
-    decoded.map_err(NarError::storage)?;
+    decoded?;
     if let Some(error) = first.lock().unwrap().take() {
         return Err(error);
     }
@@ -753,16 +753,16 @@ pub(crate) async fn read_directory(
             "missing directory",
         ))
     })?;
-    let mut bytes = Vec::new();
-    payload.read_to_end(&mut bytes).await?;
-    let directory = Directory::decode(&bytes).map_err(NarError::storage)?;
-    if ObjectKey::directory(directory.digest()) != *key {
-        return Err(NarError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "directory identity mismatch",
-        )));
-    }
-    Ok(directory)
+    let limits = reader.hold.repository().limits();
+    let record = payload.record().clone();
+    crate::directory::read::read_directory_payload(
+        key,
+        &record,
+        &mut payload,
+        limits.max_metadata_bytes.min(limits.max_payload_bytes),
+    )
+    .await
+    .map_err(NarError::storage)
 }
 struct Encoder<'a> {
     reader: &'a RetainedReader,

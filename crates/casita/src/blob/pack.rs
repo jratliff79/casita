@@ -503,7 +503,14 @@ impl CatalogShardCache {
     }
 }
 
-#[derive(Default)]
+/// Test pause between taking the staging batch and installing it in flight.
+#[cfg(test)]
+struct FlushHandoffHook {
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[derive(Clone, Default)]
 struct Batch {
     chunks: Vec<(ChunkMeta, Bytes)>,
     digests: HashSet<ChunkId>,
@@ -1466,8 +1473,11 @@ pub(crate) struct PackedChunks {
     base: Path,
     target_size: u64,
     index: RwLock<Index>,
+    // Lock order: `staging` before `inflight`. Every move of a chunk between
+    // the two, and every lookup across both, holds `staging`, so a staged chunk
+    // is always visible in one of them until its pack is in `index`.
     staging: Mutex<Batch>,
-    inflight: Mutex<Option<Batch>>,
+    inflight: Mutex<Option<Arc<Batch>>>,
     flush_lock: Mutex<()>,
     rebuild_lock: Mutex<()>,
     checkpoint_lock: Mutex<()>,
@@ -1477,6 +1487,8 @@ pub(crate) struct PackedChunks {
     catalog_prepared: AtomicBool,
     #[cfg(test)]
     prepared_index_catalog: StdMutex<Option<PreparedIndexCatalog>>,
+    #[cfg(test)]
+    flush_handoff_hook: StdMutex<Option<FlushHandoffHook>>,
     index_dirty: AtomicBool,
     state_catalog_mode: AtomicBool,
     dirty_packs: Mutex<HashSet<PackId>>,
@@ -1640,6 +1652,8 @@ impl PackedChunks {
             catalog_prepared: AtomicBool::new(false),
             #[cfg(test)]
             prepared_index_catalog: StdMutex::new(None),
+            #[cfg(test)]
+            flush_handoff_hook: StdMutex::new(None),
             index_dirty: AtomicBool::new(false),
             state_catalog_mode: AtomicBool::new(state_catalog_mode),
             dirty_packs: Mutex::new(HashSet::new()),
@@ -1693,6 +1707,11 @@ impl PackedChunks {
         digest: &ChunkId,
         pins: &crate::metadata::WritePins,
     ) -> io::Result<bool> {
+        // Check in the order chunks move (staging, inflight, index) so a
+        // concurrent flush cannot slip a chunk past this probe.
+        if self.is_staged(digest).await {
+            return Ok(true);
+        }
         if let Some(location) = self.location(digest).await? {
             if !pins.is_empty() {
                 let path = pack_path(&self.base, &location.pack);
@@ -1722,15 +1741,7 @@ impl PackedChunks {
                 }
             }
         }
-        if self.staging.lock().await.digests.contains(digest) {
-            return Ok(true);
-        }
-        Ok(self
-            .inflight
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|batch| batch.digests.contains(digest)))
+        Ok(false)
     }
 
     /// Record that a whole-payload manifest is visible. The membership set is
@@ -3132,23 +3143,29 @@ impl PackedChunks {
             if staging.is_empty() {
                 return Ok(());
             }
-            std::mem::take(&mut *staging)
+            let batch = Arc::new(std::mem::take(&mut *staging));
+            #[cfg(test)]
+            self.pause_at_flush_handoff().await;
+            // Install before releasing `staging` so readers never observe the
+            // batch in neither place.
+            *self.inflight.lock().await = Some(Arc::clone(&batch));
+            batch
         };
-        *self.inflight.lock().await = Some(batch);
-        let sealed = {
-            let inflight = self.inflight.lock().await;
-            seal(inflight.as_ref().expect("inflight batch installed"))?
+        let result = match seal(&batch) {
+            Ok(sealed) => put_object(
+                &self.object_store,
+                &pack_path(&self.base, &sealed.id),
+                sealed.bytes.clone(),
+                true,
+            )
+            .await
+            .map_err(io::Error::other)
+            .map(|()| sealed),
+            Err(error) => Err(error),
         };
-        let result = put_object(
-            &self.object_store,
-            &pack_path(&self.base, &sealed.id),
-            sealed.bytes.clone(),
-            true,
-        )
-        .await
-        .map_err(io::Error::other);
+        drop(batch);
         match result {
-            Ok(()) => {
+            Ok(sealed) => {
                 // Cache independent frames so reads share one budget regardless of
                 // whether the bytes came from publication or a remote fetch.
                 let evictions = {
@@ -3179,18 +3196,22 @@ impl PackedChunks {
                     self.record_pack_mutation(sealed.id);
                 }
                 self.index_dirty.store(true, Ordering::Release);
+                // The pack is indexed above, so clearing here leaves no gap.
                 *self.inflight.lock().await = None;
                 Ok(())
             }
             Err(error) => {
-                let failed = self.inflight.lock().await.take().expect("inflight batch");
                 let mut staging = self.staging.lock().await;
-                for (meta, bytes) in failed.chunks.into_iter().rev() {
-                    if !staging.digests.contains(&meta.digest) {
-                        staging.chunks.insert(0, (meta.clone(), bytes));
-                        staging.digests.insert(meta.digest);
-                    }
-                }
+                let failed = self.inflight.lock().await.take().expect("inflight batch");
+                let failed = Arc::try_unwrap(failed).unwrap_or_else(|shared| Batch::clone(&shared));
+                let staging = &mut *staging;
+                let mut chunks: Vec<_> = failed
+                    .chunks
+                    .into_iter()
+                    .filter(|(meta, _)| staging.digests.insert(meta.digest))
+                    .collect();
+                chunks.append(&mut staging.chunks);
+                staging.chunks = chunks;
                 staging.bytes = staging
                     .chunks
                     .iter()
@@ -3598,6 +3619,28 @@ impl PackedChunks {
         self.reader().load_catalog_shard(reference).await
     }
 
+    /// Download and authenticate one immutable shard map.
+    async fn load_catalog_map(&self, digest: Digest) -> io::Result<ShardMap> {
+        self.read_counters
+            .index_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let bytes = self
+            .object_store
+            .get(&sharded_path(&self.base, INDEXES_KIND, &digest))
+            .await
+            .map_err(object_store_io_error)?
+            .bytes()
+            .await
+            .map_err(io::Error::other)?;
+        self.read_counters
+            .index_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if Digest::from(blake3::hash(&bytes)) != digest {
+            return Err(io::Error::other("catalog shard-map identity mismatch"));
+        }
+        decode_shard_map(&bytes)
+    }
+
     async fn load_catalog_run(&self, reference: CatalogRunRef) -> io::Result<CatalogRun> {
         self.reader().load_catalog_run(reference).await
     }
@@ -3822,8 +3865,29 @@ impl PackedChunks {
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn pause_at_flush_handoff(&self) {
+        let hook = self.flush_handoff_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            let _ = hook.reached.send(());
+            let _ = hook.resume.await;
+        }
+    }
+
+    async fn is_staged(&self, digest: &ChunkId) -> bool {
+        let staging = self.staging.lock().await;
+        staging.digests.contains(digest)
+            || self
+                .inflight
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|batch| batch.digests.contains(digest))
+    }
+
     async fn staged(&self, digest: &ChunkId) -> Option<(u64, Bytes)> {
-        if let Some(found) = self.staging.lock().await.get(digest) {
+        let staging = self.staging.lock().await;
+        if let Some(found) = staging.get(digest) {
             return Some(found);
         }
         self.inflight
@@ -4391,8 +4455,10 @@ impl PackedChunks {
                 extensions: Default::default(),
             }
         } else {
-            match self
-                .object_store
+            // The pointer is the shared catalog's compare-and-swap. A store
+            // that cannot condition the write would let concurrent publishers
+            // overwrite each other, so refuse rather than degrade to `put`.
+            self.object_store
                 .put_opts(
                     &catalog_path,
                     catalog.clone().into(),
@@ -4402,24 +4468,19 @@ impl PackedChunks {
                     },
                 )
                 .await
-            {
-                Ok(result) => result,
-                Err(
+                .map_err(|error| match error {
                     object_store::Error::NotImplemented { .. }
-                    | object_store::Error::NotSupported { .. },
-                ) => {
-                    self.read_counters
-                        .index_put_requests
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.read_counters
-                        .index_put_bytes
-                        .fetch_add(catalog.len() as u64, Ordering::Relaxed);
-                    self.object_store
-                        .put(&catalog_path, catalog.clone().into())
-                        .await?
-                }
-                Err(error) => return Err(error),
-            }
+                    | object_store::Error::NotSupported { .. } => {
+                        object_store::Error::NotSupported {
+                            source: Box::new(io::Error::other(format!(
+                                "pack catalog publication requires conditional writes \
+                                 from the object store (for a local directory, use \
+                                 ChunkedBlobStore::local_packed): {error}"
+                            ))),
+                        }
+                    }
+                    error => error,
+                })?
         };
         next.version = Some(result.into());
         next.pointer_digest = Some(blake3::hash(&catalog).into());
@@ -5527,47 +5588,17 @@ impl PackedChunks {
         &self,
         base: &CatalogBase,
         refs: &mut BTreeMap<u8, CatalogRunRef>,
-        lazy: &LazyCatalogOverlay,
+        current: Option<&ShardMap>,
     ) -> io::Result<(CatalogBase, Option<ShardedIndexBase>)> {
-        let CatalogBase::Sharded { root, shard_bits } = base else {
+        let CatalogBase::Sharded { shard_bits, .. } = base else {
             return Ok((base.clone(), None));
         };
-        let loaded;
-        let current = if let Some(current) = lazy.base.as_ref() {
-            current
-        } else {
-            self.read_counters
-                .index_requests
-                .fetch_add(1, Ordering::Relaxed);
-            let bytes = self
-                .object_store
-                .get(&sharded_path(&self.base, INDEXES_KIND, root))
-                .await
-                .map_err(io::Error::other)?
-                .bytes()
-                .await
-                .map_err(io::Error::other)?;
-            self.read_counters
-                .index_bytes
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            let started = Instant::now();
-            let actual = Digest::from(blake3::hash(&bytes));
-            self.read_counters.index_hash_nanos.fetch_add(
-                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-            if actual != *root {
-                return Err(io::Error::other("catalog shard-map identity mismatch"));
-            }
-            loaded = ShardedIndexBase {
-                map: Arc::new(decode_shard_map(&bytes)?),
-            };
-            &loaded
-        };
-        if current.map.shard_bits != *shard_bits {
+        let current =
+            current.ok_or_else(|| io::Error::other("sharded catalog has no loaded map"))?;
+        if current.shard_bits != *shard_bits {
             return Err(io::Error::other("sharded catalog map width changed"));
         }
-        let mut map = (*current.map).clone();
+        let mut map = current.clone();
         let previous_routing = std::mem::take(&mut map.run_routing);
         for reference in refs.values_mut() {
             let Some(query) = reference.query.as_mut() else {
@@ -5615,6 +5646,24 @@ impl PackedChunks {
                 source: "cannot checkpoint a partially materialized sharded catalog".into(),
             });
         }
+        // A publication without index mutations, such as one that only updates
+        // sidecars, would otherwise fall through to the checkpoint branch below
+        // and rebuild the base from `candidate`. After a lazy open of a sharded
+        // base, `candidate` holds only the entries this process materialized,
+        // so that checkpoint would silently drop every other chunk, pack and
+        // manifest. Publish an empty delta over the unchanged base instead.
+        let empty_delta;
+        let delta = match delta {
+            None if !force && lazy.base.is_some() && witness.root.is_some() => {
+                empty_delta = encode_index_mutations(candidate, &IndexMutations::default())
+                    .map_err(|error| object_store::Error::Generic {
+                        store: "pack index catalog",
+                        source: Box::new(error),
+                    })?;
+                Some(&empty_delta[..])
+            }
+            delta => delta,
+        };
         let generation =
             witness
                 .generation
@@ -5712,6 +5761,29 @@ impl PackedChunks {
                 })?),
             };
 
+            // Sharded roots externalize routing into their map. A lazily
+            // opened catalog holds that map as its base. A checkpoint that
+            // outgrew the inline limit publishes a sharded root while this
+            // process keeps its index materialized, so the map is read back
+            // instead: installing it as a lazy base would claim the
+            // materialized index is only an overlay.
+            let loaded_map = match (&previous.base, &lazy.base) {
+                (CatalogBase::Sharded { root, .. }, None) => {
+                    Some(self.load_catalog_map(*root).await.map_err(|error| {
+                        object_store::Error::Generic {
+                            store: "pack index catalog",
+                            source: Box::new(error),
+                        }
+                    })?)
+                }
+                _ => None,
+            };
+            let current_map = lazy
+                .base
+                .as_ref()
+                .map(|base| &*base.map)
+                .or(loaded_map.as_ref());
+
             let mut staged = Vec::with_capacity(usize::from(target_level) + 1);
             for level in 0..target_level {
                 let reference =
@@ -5722,14 +5794,26 @@ impl PackedChunks {
                             store: "pack index catalog",
                             source: "catalog run carry has a missing lower level".into(),
                         })?;
-                // Sharded roots externalize routing into their map. The lazy
-                // references are the authenticated, hydrated copies.
-                let reference = lazy
+                // The lazy references are the authenticated, hydrated copies.
+                let mut reference = lazy
                     .run_refs
                     .values()
                     .find(|hydrated| hydrated.digest == reference.digest)
                     .unwrap_or(reference)
                     .clone();
+                if let Some(query) = reference.query.as_mut()
+                    && query.routing.is_empty()
+                    && let Some(map) = current_map
+                {
+                    query.routing =
+                        map.run_routing
+                            .get(&reference.digest)
+                            .cloned()
+                            .ok_or_else(|| object_store::Error::Generic {
+                                store: "pack index catalog",
+                                source: "sharded catalog map is missing run routing".into(),
+                            })?;
+                }
                 staged.push(self.stage_catalog_run(reference).await.map_err(|error| {
                     object_store::Error::Generic {
                         store: "pack index catalog",
@@ -5773,7 +5857,7 @@ impl PackedChunks {
             }
             refs.insert(target_level, merged_reference);
             let (base, prepared_map) = self
-                .externalize_catalog_run_routing(&previous.base, &mut refs, lazy)
+                .externalize_catalog_run_routing(&previous.base, &mut refs, current_map)
                 .await
                 .map_err(|error| object_store::Error::Generic {
                     store: "pack index catalog",
@@ -5797,6 +5881,13 @@ impl PackedChunks {
                 prepared_map,
             )
         } else {
+            // `candidate` is the complete index only without a lazy base.
+            if lazy.base.is_some() {
+                return Err(object_store::Error::Generic {
+                    store: "pack index catalog",
+                    source: "cannot checkpoint a partially materialized sharded catalog".into(),
+                });
+            }
             let checkpoint = encode_index_checkpoint(
                 candidate,
                 Digest::from(blake3::hash(b"casita authoritative pack index v1\0")),
@@ -6639,6 +6730,7 @@ mod tests {
         delete_fail_at: Arc<AtomicU64>,
         catalog_deletes: Arc<AtomicU64>,
         delete_resume: Arc<tokio::sync::Notify>,
+        fail_pack_puts: AtomicBool,
     }
 
     impl FailingCatalogPutStore {
@@ -6650,6 +6742,7 @@ mod tests {
                 delete_fail_at: Arc::new(AtomicU64::new(u64::MAX)),
                 catalog_deletes: Arc::new(AtomicU64::new(0)),
                 delete_resume: Arc::new(tokio::sync::Notify::new()),
+                fail_pack_puts: AtomicBool::new(false),
             }
         }
 
@@ -6690,6 +6783,14 @@ mod tests {
             payload: PutPayload,
             options: PutOptions,
         ) -> object_store::Result<PutResult> {
+            if self.fail_pack_puts.load(Ordering::SeqCst)
+                && location.parts().any(|part| part.as_ref() == PACKS_KIND)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "pack-put-test",
+                    source: "injected pack PUT failure".into(),
+                });
+            }
             if location.as_ref().contains("/pack-indexes/") {
                 let ordinal = self.catalog_puts.fetch_add(1, Ordering::SeqCst) + 1;
                 if self.fail_at.load(Ordering::SeqCst) == 0 {
@@ -6785,6 +6886,79 @@ mod tests {
             },
             compressed.into(),
         )
+    }
+
+    #[tokio::test]
+    async fn staged_chunk_stays_visible_across_flush_handoff() {
+        let packed = PackedChunks::open_with_state_catalog(
+            Arc::new(InMemory::new()),
+            Path::from("flush-handoff"),
+            u64::MAX,
+            0,
+            &PackedChunks::empty_state_catalog().unwrap(),
+        )
+        .await
+        .unwrap();
+        let (meta, bytes) = chunk(b"read while its batch changes hands");
+        packed.put(meta.clone(), bytes.clone()).await.unwrap();
+        let (reached_tx, reached) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = tokio::sync::oneshot::channel();
+        *packed.flush_handoff_hook.lock().unwrap() = Some(FlushHandoffHook {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        let flush = tokio::spawn({
+            let packed = packed.clone();
+            async move { packed.flush().await }
+        });
+        reached.await.unwrap();
+        // The flush task is parked in the handoff and, on this single threaded
+        // runtime, only advances once the reads below yield. They therefore
+        // observe the handoff state itself, or wait for it to complete.
+        resume.send(()).unwrap();
+        let probed = packed.probe(&meta.digest).await.unwrap();
+        let read = packed.get(&meta.digest).await.unwrap();
+        flush.await.unwrap().unwrap();
+        assert!(probed, "probe missed a chunk mid flush");
+        assert_eq!(read, Some(bytes.clone()), "read missed a chunk mid flush");
+        assert_eq!(packed.get(&meta.digest).await.unwrap(), Some(bytes));
+    }
+
+    #[tokio::test]
+    async fn failed_pack_upload_requeues_batch_in_order() {
+        let fault = Arc::new(FailingCatalogPutStore::new());
+        let objects: Arc<dyn ObjectStore> = fault.clone();
+        let writer = PackedChunks::open(objects, Path::from("failed-pack-upload"), u64::MAX)
+            .await
+            .unwrap();
+        let chunks: Vec<_> = (0..3)
+            .map(|index| chunk(format!("requeued chunk {index}").as_bytes()))
+            .collect();
+        for (meta, bytes) in &chunks {
+            writer.put(meta.clone(), bytes.clone()).await.unwrap();
+        }
+        fault.fail_pack_puts.store(true, Ordering::SeqCst);
+        let error = writer.flush().await.unwrap_err();
+        assert!(error.to_string().contains("injected pack PUT failure"));
+        {
+            let staging = writer.staging.lock().await;
+            let order: Vec<_> = staging.chunks.iter().map(|(meta, _)| meta.digest).collect();
+            let expected: Vec<_> = chunks.iter().map(|(meta, _)| meta.digest).collect();
+            assert_eq!(order, expected);
+            assert_eq!(staging.digests.len(), chunks.len());
+            let bytes: u64 = chunks.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+            assert_eq!(staging.bytes, bytes);
+        }
+        assert!(writer.inflight.lock().await.is_none());
+        for (meta, bytes) in &chunks {
+            assert_eq!(writer.get(&meta.digest).await.unwrap(), Some(bytes.clone()));
+        }
+        fault.fail_pack_puts.store(false, Ordering::SeqCst);
+        writer.flush().await.unwrap();
+        assert!(writer.staging.lock().await.is_empty());
+        for (meta, bytes) in &chunks {
+            assert_eq!(writer.get(&meta.digest).await.unwrap(), Some(bytes.clone()));
+        }
     }
 
     #[tokio::test]
@@ -8099,6 +8273,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sidecar_only_publication_keeps_a_lazy_sharded_base() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let base = Path::from("lazy-sharded-sidecar-only");
+        let writer = PackedChunks::open(objects.clone(), base.clone(), u64::MAX)
+            .await
+            .unwrap();
+        let (meta, compressed) = chunk(b"payload known only to the sharded base");
+        writer.put(meta.clone(), compressed.clone()).await.unwrap();
+        writer.flush().await.unwrap();
+        let index = writer.index.read().unwrap().clone();
+        let encoded = encode_index_shards(&index, 4).unwrap();
+        for (digest, bytes) in &encoded.objects {
+            put_object(
+                &objects,
+                &sharded_path(&base, INDEXES_KIND, digest),
+                bytes.clone(),
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        put_object(
+            &objects,
+            &sharded_path(&base, INDEXES_KIND, &encoded.map_digest),
+            encoded.map,
+            true,
+        )
+        .await
+        .unwrap();
+        let catalog = encode_delta_catalog(&DeltaCatalog {
+            sidecars: None,
+            generation: 7,
+            base: CatalogBase::Sharded {
+                root: encoded.map_digest,
+                shard_bits: 4,
+            },
+            runs: BTreeMap::new(),
+            deltas: Vec::new(),
+        })
+        .unwrap();
+        let reader = PackedChunks::open_with_state_catalog(
+            objects.clone(),
+            base.clone(),
+            u64::MAX,
+            0,
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.index.read().unwrap().chunks.len(), 0);
+
+        // Only a sidecar changes, so this publication carries no index delta.
+        let blob = BlobId::new(blake3::hash(b"sidecar-only publication").into());
+        reader
+            .put_sidecar(blob, Bytes::from_static(b"outboard"))
+            .await
+            .unwrap();
+        let next = reader
+            .prepare_state_catalog()
+            .await
+            .unwrap()
+            .expect("a dirty sidecar publishes a catalog");
+        reader.finish_state_catalog(true).unwrap();
+        let root = decode_delta_catalog(&next).unwrap();
+        assert!(
+            matches!(root.base, CatalogBase::Sharded { root, .. } if root == encoded.map_digest),
+            "the lazily opened base must not be replaced by a checkpoint of the materialized index"
+        );
+
+        let reopened = PackedChunks::open_with_state_catalog(objects, base, u64::MAX, 0, &next)
+            .await
+            .unwrap();
+        assert_eq!(reopened.get(&meta.digest).await.unwrap(), Some(compressed));
+        assert_eq!(
+            reopened.sidecar(blob, None).await.unwrap(),
+            Some(Bytes::from_static(b"outboard"))
+        );
+    }
+
+    #[tokio::test]
     async fn scoped_catalog_cache_does_not_retain_reader_leases() {
         use crate::metadata::{DataPin, DataPinLease, MemoryPinStore, PinScope, PinStore};
         let catalog = PackedChunks::empty_state_catalog().unwrap();
@@ -8646,6 +8900,83 @@ mod tests {
         reader.reset_read_stats();
         assert_eq!(reader.metadata(&wanted.digest).await.unwrap(), Some(4096));
         assert_eq!(reader.read_stats().index_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn materialized_checkpoint_that_outgrows_inline_carries_runs_into_its_map() {
+        let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let base = Path::from("materialized-sharded-carry");
+        let empty = PackedChunks::empty_state_catalog().unwrap();
+        let writer = PackedChunks::open_with_state_catalog(
+            objects.clone(),
+            base.clone(),
+            u64::MAX,
+            0,
+            &empty,
+        )
+        .await
+        .unwrap();
+        let manifests = |label: &[u8], count: usize| {
+            (0..count as u64)
+                .map(|ordinal| {
+                    let mut key = Vec::from(label);
+                    key.extend_from_slice(&ordinal.to_le_bytes());
+                    BlobId::new(blake3::hash(&key).into())
+                })
+                .collect::<Vec<_>>()
+        };
+        let carry_len = delta::MAX_INLINE_DELTA_BYTES / DIGEST_LEN + 1;
+
+        let checkpointed = manifests(
+            b"materialized checkpoint manifest ",
+            INDEX_INLINE_BASE_MAX_BYTES / DIGEST_LEN + 1,
+        );
+        for digest in &checkpointed {
+            writer.register_manifest(*digest);
+        }
+        writer.prepare_state_catalog().await.unwrap().unwrap();
+        writer.finish_state_catalog(true).unwrap();
+
+        // A commit with no index mutation (here a sidecar) checkpoints the
+        // whole materialized index. It outgrows the inline limit, so this
+        // process publishes a sharded root without ever loading its map.
+        writer
+            .put_sidecar(checkpointed[0], Bytes::from_static(b"outboard"))
+            .await
+            .unwrap();
+        writer.prepare_state_catalog().await.unwrap().unwrap();
+        writer.finish_state_catalog(true).unwrap();
+        let root = writer.index_catalog.lock().unwrap().root.clone().unwrap();
+        assert!(matches!(root.base, CatalogBase::Sharded { .. }));
+        assert!(root.runs.is_empty());
+        assert!(writer.lazy_catalog.read().unwrap().base.is_none());
+
+        // Carry into level 0, merge into level 1, then land beside it at
+        // level 0; the untouched level-1 run keeps its routing in the map.
+        let mut catalog = Vec::new();
+        let mut carried = Vec::new();
+        for (carry, levels) in [(0_u8, &[0_u8][..]), (1, &[1]), (2, &[0, 1])] {
+            let digests = manifests(
+                &[b"materialized carry manifest ".as_slice(), &[carry]].concat(),
+                carry_len,
+            );
+            for digest in &digests {
+                writer.register_manifest(*digest);
+            }
+            catalog = writer.prepare_state_catalog().await.unwrap().unwrap();
+            writer.finish_state_catalog(true).unwrap();
+            let root = writer.index_catalog.lock().unwrap().root.clone().unwrap();
+            assert!(root.deltas.is_empty());
+            assert_eq!(root.runs.keys().copied().collect::<Vec<_>>(), levels);
+            carried.extend(digests);
+        }
+
+        let reopened = PackedChunks::open_with_state_catalog(objects, base, u64::MAX, 0, &catalog)
+            .await
+            .unwrap();
+        for digest in [&checkpointed[0], &carried[0], carried.last().unwrap()] {
+            assert!(!reopened.manifest_definitely_absent(digest));
+        }
     }
 
     #[tokio::test]
@@ -11533,6 +11864,46 @@ mod tests {
         for (meta, _) in &chunks[3..] {
             assert!(reopened.get(&meta.digest).await.unwrap().is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn catalog_pointer_refuses_stores_without_conditional_updates() {
+        // LocalFileSystem supports create-only puts but not `PutMode::Update`.
+        // Without the local catalog lock, publication must fail rather than
+        // overwrite a pointer another writer may have advanced.
+        let directory = tempfile::tempdir().unwrap();
+        let objects: Arc<dyn ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap(),
+        );
+        let base = Path::from("repository");
+        let store = ChunkedBlobStore::packed_with_options(
+            objects.clone(),
+            base.clone(),
+            DEFAULT_AVG_CHUNK_SIZE,
+            crate::PackOptions {
+                target_size: u64::MAX,
+                cache_capacity: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let pointer = base.clone().join(INDEX_POINTER_NAME);
+        let read_pointer = || async { objects.get(&pointer).await.unwrap().bytes().await.unwrap() };
+        let opened = read_pointer().await;
+        let error = store.put_slice(b"small file").await.unwrap_err();
+        let unsupported = matches!(
+            &error,
+            crate::error::Error::Io(io) if matches!(
+                io.get_ref().and_then(|inner| inner.downcast_ref::<object_store::Error>()),
+                Some(object_store::Error::NotSupported { .. })
+            )
+        );
+        assert!(unsupported, "{error}");
+        assert_eq!(
+            read_pointer().await,
+            opened,
+            "the pointer must not be overwritten"
+        );
     }
 
     #[tokio::test]

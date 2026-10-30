@@ -10,10 +10,11 @@
 pub use crate::blob::{
     BlobBatchGuard, BlobChunkSource, BlobGc, BlobIntegrityError, BlobReader, BlobRepairError,
     BlobStore, BlobStreamReader, BlobSync, BlobWriter, CatalogMaintenance, CatalogOutcome,
-    CatalogPublication, ChunkedBlobStore, CombinedBlobStore, DEFAULT_AVG_CHUNK_SIZE,
-    DEFAULT_CHUNK_MEMORY_BUDGET_BYTES, DEFAULT_LOCAL_PACK_TARGET_SIZE, DEFAULT_PACK_CACHE_CAPACITY,
-    DEFAULT_PACK_COMPACTION_DEAD_PERCENT, DEFAULT_PACK_TARGET_SIZE, MemoryBlobStore, PackOptions,
-    PackReadStats, PayloadPublication, PreparedCatalog, RepairingBlobStore, is_integrity_error,
+    CatalogPublication, ChunkedBlobStore, CombinedBlobStore, CommitDurability,
+    DEFAULT_AVG_CHUNK_SIZE, DEFAULT_CHUNK_MEMORY_BUDGET_BYTES, DEFAULT_LOCAL_PACK_TARGET_SIZE,
+    DEFAULT_PACK_CACHE_CAPACITY, DEFAULT_PACK_COMPACTION_DEAD_PERCENT, DEFAULT_PACK_TARGET_SIZE,
+    MemoryBlobStore, PackOptions, PackReadStats, PayloadPublication, PreparedCatalog,
+    RepairingBlobStore, is_integrity_error,
 };
 pub use crate::casitar::{
     CASITAR_MAGIC, CasitarError, CasitarFrameHeader, CasitarHeader, MAX_CASITAR_HEADER_BYTES,
@@ -33,6 +34,8 @@ pub use crate::collection::{
 };
 pub use crate::digest::{BlobId, ChunkId, Digest, DigestError, DirectoryId, ObjectId};
 pub use crate::directory::Directory;
+#[cfg(feature = "native")]
+pub use crate::directory::read::read_directory_payload;
 pub use crate::encode::DirectoryDecodeError;
 pub use crate::error::{DirectoryError, Error, RetryDisposition};
 pub use crate::format::{
@@ -76,6 +79,8 @@ pub use crate::git::{
     GitViewBody, GitViewFormat, MAX_SYMBOLIC_REF_DEPTH, git_key_parts, git_object_key,
     git_object_key_for_body, parse_git_tree,
 };
+#[cfg(feature = "git")]
+pub use crate::importers::GitClosureImportError;
 pub use crate::ipld::{
     BLAKE3_256_MULTIHASH, CASITA_LINKED_CODEC, IPLD_LINKED_NAMESPACE, IPLD_RAW_NAMESPACE, IpldCid,
     IpldError, LinkedIpld, LinkedIpldFormat, RAW_CODEC, RawIpldFormat,
@@ -86,8 +91,8 @@ pub use crate::linked::{
 pub use crate::node::Node;
 pub use crate::object::{
     BLOB_NAMESPACE, DIRECTORY_NAMESPACE, LogicalEncodingError, NamespaceId, NamespaceIdError,
-    ObjectKey, ObjectKeyError, ObjectRecord, ObjectRecordError, RepositoryRevision,
-    RepositoryRevisionError, RootName, RootNameError, RootRecord,
+    ObjectKey, ObjectKeyError, ObjectRecord, ObjectRecordError, RepositoryGeneration,
+    RepositoryRevision, RepositoryRevisionError, RootName, RootNameError, RootRecord,
 };
 #[cfg(feature = "native")]
 pub use crate::repository::RootRetention;
@@ -152,6 +157,8 @@ pub use crate::metadata::{
 };
 #[cfg(feature = "s3")]
 pub use crate::metadata::{Wal3MetadataStore, Wal3ReadStats, Wal3RepositoryHold};
+#[cfg(feature = "oci")]
+pub use crate::oci::{OciImportError, OciImportLimits, OciImportReport, OciRootfsLimits};
 pub use crate::path::{PathComponent, PathComponentError, SymlinkTarget, SymlinkTargetError};
 #[cfg(feature = "native")]
 pub use crate::repository::{

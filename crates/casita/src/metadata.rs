@@ -395,9 +395,7 @@ pub trait MetadataSnapshot: Send + Sync {
     /// remain unchanged by idempotent insertion and checkpoint rewrites.
     /// Backends must persist the counter atomically with each successful commit.
     fn generation(&self) -> Result<u64, MetadataError> {
-        Err(MetadataError::Backend(
-            "metadata backend does not support snapshot generations".into(),
-        ))
+        Err(MetadataError::UnsupportedMetadata)
     }
 
     /// Stream current records first inserted at or before `generation`.
@@ -408,9 +406,7 @@ pub trait MetadataSnapshot: Send + Sync {
         _generation: u64,
     ) -> BoxStream<'static, Result<ObjectRecord, MetadataError>> {
         Box::pin(stream::once(async {
-            Err(MetadataError::Backend(
-                "metadata backend does not support snapshot generations".into(),
-            ))
+            Err(MetadataError::UnsupportedMetadata)
         }))
     }
 
@@ -661,6 +657,16 @@ pub trait MetadataStore: Send + Sync {
         None
     }
 
+    /// How to make this store's acknowledged commits durable, for a store
+    /// whose acknowledgement can stop short of stable storage. The repository
+    /// hands it to the payload store, which applies it before deleting
+    /// anything a commit made unreachable. Stores durable on acknowledgement
+    /// return `None`; wrappers must forward it.
+    #[doc(hidden)]
+    fn commit_durability(&self) -> Option<crate::blob::CommitDurability> {
+        None
+    }
+
     /// Read only the requested application records from one consistent view.
     /// A backend may avoid loading unrelated object or payload catalogs when
     /// the caller needs neither a revision token nor a retained snapshot.
@@ -829,6 +835,38 @@ impl MetadataSnapshot for MemorySnapshot {
 
     async fn object(&self, key: &ObjectKey) -> Result<Option<ObjectRecord>, MetadataError> {
         Ok(self.objects.get(key).cloned())
+    }
+
+    async fn object_payload_batch(
+        &self,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Option<(crate::BlobId, u64)>>, MetadataError> {
+        Ok(keys
+            .iter()
+            .map(|key| {
+                self.objects
+                    .get(key)
+                    .map(|record| (record.payload(), record.payload_size()))
+            })
+            .collect())
+    }
+
+    async fn validated_payload_batch(
+        &self,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Option<(crate::BlobId, u64)>>, MetadataError> {
+        Ok(keys
+            .iter()
+            .map(|key| {
+                if self.validated.contains(key) {
+                    self.objects
+                        .get(key)
+                        .map(|record| (record.payload(), record.payload_size()))
+                } else {
+                    None
+                }
+            })
+            .collect())
     }
 
     async fn validated_closures(&self, keys: &[ObjectKey]) -> Result<Vec<bool>, MetadataError> {

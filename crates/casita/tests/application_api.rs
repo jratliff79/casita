@@ -230,14 +230,13 @@ async fn writes_publish_verified_content_without_preparation() {
         let child = filesystem.object(&root).await.unwrap().unwrap().links()[0].clone();
         verify(&filesystem, &child, &bytes).await;
 
-        let mut tar = tokio_tar::Builder::new(Vec::new());
-        let mut header = tokio_tar::Header::new_ustar();
+        let mut tar = ::tar::Builder::new(Vec::new());
+        let mut header = ::tar::Header::new_ustar();
         header.set_size(bytes.len() as u64);
         header.set_mode(0o644);
         tar.append_data(&mut header, "file", bytes.as_slice())
-            .await
             .unwrap();
-        let archive = tar.into_inner().await.unwrap();
+        let archive = tar.into_inner().unwrap();
         let destination = Repository::local(work.path().join("tar")).await.unwrap();
         let report = destination
             .import(casita::import::TarImport::new(
@@ -1029,5 +1028,52 @@ async fn verified_readers_scope_retention_and_survive_gc_before_first_read() {
             );
             collector.flush().await.unwrap();
         }
+    }
+}
+
+#[tokio::test]
+async fn generations_order_the_states_readers_observe() {
+    let directory = tempfile::tempdir().unwrap();
+    for repository in [
+        Repository::memory().unwrap(),
+        Repository::local(directory.path()).await.unwrap(),
+    ] {
+        let key = MetadataKey::new("generations.v1".parse().unwrap(), "counter");
+        let before = repository.retained_reader().await.unwrap();
+        let metadata_before = repository.metadata_reader().await.unwrap();
+
+        assert_eq!(
+            before.generation().unwrap(),
+            metadata_before.generation().unwrap()
+        );
+
+        let mut previous = before.generation().unwrap();
+
+        for value in 0..3u8 {
+            // Record-only commits advance the order as much as object ones.
+            repository
+                .commit(
+                    Vec::new(),
+                    vec![MetadataChange::Set {
+                        key: key.clone(),
+                        value: vec![value].into(),
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let reader = repository.retained_reader().await.unwrap();
+
+            assert!(reader.generation().unwrap() > previous);
+            assert_ne!(reader.revision(), before.revision());
+
+            previous = reader.generation().unwrap();
+        }
+
+        // A reader keeps its own position; a fresh one of an unchanged
+        // repository shares it.
+        assert!(before.generation().unwrap() < previous);
+        let again = repository.metadata_reader().await.unwrap();
+        assert_eq!(again.generation().unwrap(), previous);
     }
 }

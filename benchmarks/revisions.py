@@ -41,6 +41,22 @@ class SuiteBuildSpec:
 
 
 SUITE_BUILD_SPECS = {
+    "git-closure-import": SuiteBuildSpec(
+        ("test", "--release", "--no-default-features", "--features", "native,git,experimental", "--test", "git_closure_import", "--no-run", "--message-format=json"),
+        "--probe-binary", "git_closure_import", cargo_json_test="git_closure_import", supports_report=False,
+    ),
+    "git-closure-audit": SuiteBuildSpec(
+        ("test", "--release", "--no-default-features", "--features", "native,git,experimental", "--test", "git_closure_custom_formats", "--no-run", "--message-format=json"),
+        "--probe-binary", "git_closure_custom_formats", cargo_json_test="git_closure_custom_formats", supports_report=False,
+    ),
+    "git-verified-stream": SuiteBuildSpec(
+        ("test", "--release", "--no-default-features", "--features", "native,git,experimental", "--test", "verified_stream", "--no-run", "--message-format=json"),
+        "--probe-binary", "verified_stream", cargo_json_test="verified_stream", supports_report=False,
+    ),
+    "git-blob-file": SuiteBuildSpec(
+        ("test", "--release", "--no-default-features", "--features", "native,git,experimental", "--test", "git_blob_file", "--no-run", "--message-format=json"),
+        "--probe-binary", "git_blob_file", cargo_json_test="git_blob_file", supports_report=False,
+    ),
     "metadata-collection": SuiteBuildSpec(
         ("test", "--release", "--features", "cli", "--lib", "--no-run", "--message-format=json"),
         "--probe-binary", "casita-lib-test", cargo_json_test="casita",
@@ -150,11 +166,24 @@ SUITE_BUILD_SPECS["cdcs-corpus"] = SuiteBuildSpec(
     ("bench", "--features", "experimental", "--bench", "cdcs", "--no-run", "--message-format=json"),
     "--benchmark-bin", "cdcs", cargo_json_bench="cdcs",
 )
+SUITE_BUILD_SPECS["chunk-upload-completion"] = SuiteBuildSpec(
+    ("test", "--release", "--no-default-features", "--features", "native,experimental", "--test", "chunk_upload_completion", "--no-run", "--message-format=json"),
+    "--probe-binary", "chunk_upload_completion", cargo_json_test="chunk_upload_completion", supports_report=False,
+)
+SUITE_BUILD_SPECS["chunk-manifest-stream"] = SuiteBuildSpec(
+    ("test", "--release", "--no-default-features", "--features", "native,experimental", "--test", "chunk_manifest_stream", "--no-run", "--message-format=json"),
+    "--probe-binary", "chunk_manifest_stream", cargo_json_test="chunk_manifest_stream", supports_report=False,
+)
+SUITE_BUILD_SPECS["chunk-hash-batch"] = SuiteBuildSpec(
+    ("test", "--release", "--no-default-features", "--features", "native,experimental", "--test", "chunk_hash_batch", "--no-run", "--message-format=json"),
+    "--probe-binary", "chunk_hash_batch", cargo_json_test="chunk_hash_batch", supports_report=False,
+)
 SUITE_BUILD_SPECS["git-ingest-scheduling"] = SuiteBuildSpec(
     ("test", "--release", "--features", "cli,git", "--lib", "--no-run", "--message-format=json"),
     "--probe-binary", "casita-lib-test", cargo_json_test="casita",
 )
 SUITE_BUILD_SPECS["git-import-profile"] = SUITE_BUILD_SPECS["git-ingest-scheduling"]
+SUITE_BUILD_SPECS["git-closure-import-small-files"] = SUITE_BUILD_SPECS["git-closure-import"]
 SUITE_BUILD_SPECS["git-ingest-concurrency"] = SuiteBuildSpec(
     ("build", "--release", "--features", "cli,git", "--bin", "casita"),
     "--casita-bin", "casita", relative_artifact="release/casita",

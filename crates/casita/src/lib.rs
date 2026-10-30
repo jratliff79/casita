@@ -139,6 +139,7 @@ struct SharedPayloadServicesDoctests;
 #[doc = include_str!("../../../docs/src/content/docs/guides/s3-multi-owner.md")]
 struct S3MultiOwnerGuideDoctests;
 
+mod binary;
 #[cfg(feature = "native")]
 mod blob;
 #[cfg(feature = "native")]
@@ -154,6 +155,8 @@ mod conformance;
 mod coordination;
 mod digest;
 mod directory;
+#[cfg(feature = "native")]
+mod durable_rename;
 mod encode;
 mod error;
 #[cfg(feature = "native")]
@@ -171,6 +174,8 @@ mod linked;
 mod nar;
 mod node;
 mod object;
+#[cfg(feature = "oci")]
+mod oci;
 mod path;
 #[cfg(feature = "native")]
 mod repository;
@@ -221,9 +226,11 @@ pub use encode::DirectoryDecodeError;
 pub use error::{DirectoryError, RetryDisposition};
 pub use node::Node;
 pub use object::{
-    NamespaceId, NamespaceIdError, ObjectKey, ObjectKeyError, ObjectRecord, RepositoryRevision,
-    RepositoryRevisionError, RootName, RootNameError, RootRecord,
+    NamespaceId, NamespaceIdError, ObjectKey, ObjectKeyError, ObjectRecord, RepositoryGeneration,
+    RepositoryRevision, RepositoryRevisionError, RootName, RootNameError, RootRecord,
 };
+#[cfg(feature = "oci")]
+pub use oci::{OciImportLimits, OciImportReport, OciRootfsLimits};
 pub use path::{PathComponent, PathComponentError, SymlinkTarget, SymlinkTargetError};
 
 #[cfg(feature = "native")]
@@ -251,6 +258,8 @@ pub use casitar::{
 };
 #[cfg(feature = "git")]
 pub use git::repository::NativeGitImportOutcome;
+#[cfg(feature = "git")]
+pub use importers::{GitClosureImportOutcome, GitClosureImportReport};
 #[cfg(feature = "native")]
 pub use spill::SpillMetrics;
 #[cfg(feature = "native")]
